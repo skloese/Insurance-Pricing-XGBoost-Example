@@ -1,0 +1,749 @@
+---
+title: "XGBoost_Example"
+author: "Sam Kloese"
+date: '2022-06-08'
+output: pdf_document
+always_allow_html: true
+---
+
+## Load Packages
+
+```{r packages, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(CASdatasets) # For datasets
+library(tidyverse) # For data manipulation
+library(pdp) # For Partial Dependence Plots
+library(xgboost) # For creating xgboost
+library(SHAPforxgboost) # For Shapley Plots
+library(knitr) # For generating markdowns
+library(webshot)
+set.seed(23)
+data(pg17trainpol) # Load policy data
+data(pg17trainclaim) # Load claims data
+```
+
+## Preliminary Data Assembly
+
+```{r preliminary, echo = TRUE}
+# Take a look at our data
+glimpse(pg17trainclaim)
+glimpse(pg17trainpol)
+
+# Assemble data to model
+# Some clients had more than 1 claim in a year
+pg17trainclaim2 <- pg17trainclaim %>% # Aggregate claims to client and year
+  group_by(id_client, id_year) %>% 
+  summarize(claim_count = n(),
+            claim_amount = sum(claim_amount))
+
+# Join the policy information and claims data
+# If the client can't be found in the claims data, they had 0 claims for $0
+pg17train <- pg17trainpol %>% 
+  left_join(pg17trainclaim2, by = c("id_client", "id_year")) %>% 
+  mutate(claim_count = replace_na(claim_count, replace = 0)) %>%
+  mutate(claim_amount = replace_na(claim_amount, replace = 0)) %>% 
+  mutate(exposures = 1) %>% # Big assumption: All years are full years %>% 
+  mutate(drv_age1 = as.double(drv_age1)) %>% 
+    mutate(vh_age = as.double(vh_age)) %>% 
+  mutate(vh_din = as.double(vh_din))
+
+dim(pg17train)
+sum(pg17train$claim_count)
+
+# Remove record with NA's
+pg17train2 <- pg17train[complete.cases(pg17train),]
+
+glimpse(pg17train2)
+
+rm(pg17train, pg17trainclaim, pg17trainclaim2, pg17trainpol)
+```
+
+## Convert Predictors to Numerical Values
+
+```{r numerical, echo = TRUE}
+
+# One Hot Encoding for Training Data
+pg17train3 <- pg17train2 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = pol_coverage, value = indicator, fill = 0)
+
+pg17train3 <- pg17train3 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = pol_pay_freq, value = indicator, fill = 0)
+  
+pg17train3 <- pg17train3 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = pol_usage, value = indicator, fill = 0)
+
+pg17train3 <- pg17train3 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = drv_drv2, value = indicator, fill = 0)
+
+pg17train3 <- pg17train3 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = drv_sex1, value = indicator, fill = 0)
+
+pg17train3 <- pg17train3 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = vh_fuel, value = indicator, fill = 0)
+
+pg17train3 <- pg17train3 %>% 
+  mutate(indicator = 1) %>% 
+  spread(key = vh_type, value = indicator, fill = 0)
+
+# Remove columns we don't want to use as predictor variables
+# Mostly removed for simplicity of this example
+pg17train3 <- pg17train3 %>% 
+  select(-pol_payd, -pol_insee_code,-drv_age2, -drv_sex2, -drv_age_lic2, 
+         -vh_model, -vh_make, -id_vehicle, -id_policy, -id_year)
+
+names(pg17train3)[18:21] <- paste("coverage",names(pg17train3)[18:21],sep="_")
+names(pg17train3)[22:25] <- paste("pay",names(pg17train3)[22:25],sep="_")
+names(pg17train3)[26:29] <- paste("usage",names(pg17train3)[26:29],sep="_")
+names(pg17train3)[30]<- "second_driver_No"
+names(pg17train3)[31]<- "second_driver_Yes"
+names(pg17train3)[32]<- "driver_gender_F"
+names(pg17train3)[33]<- "driver_gender_M"
+names(pg17train3)[34:36] <- paste("fuel",names(pg17train3)[34:36],sep="_")
+names(pg17train3)[37:38] <- paste("type",names(pg17train3)[37:38],sep="_")
+
+pg17train3 <- pg17train3 %>% 
+  select(-second_driver_No,-driver_gender_M) %>% 
+  filter(claim_amount >= 0) # eliminate small number of negative claims amounts
+
+glimpse(pg17train3)
+
+rm(pg17train2)
+gc()
+```
+
+## Split Training and Testing
+
+```{r split, echo = TRUE}
+
+# 80% of clients will be used in training
+# 20% of clients will be used in testing
+clients_unique <- unique(pg17train3$id_client)
+clients_index <- sample(1:90380,
+                        size = 72304,
+                        replace = FALSE)
+clients_train <- clients_unique[clients_index]
+
+training_data <- pg17train3 %>% 
+  filter(id_client %in% clients_train) %>% 
+  select(-id_client)
+
+testing_data <- pg17train3 %>% 
+  filter(!(id_client %in% clients_train))
+
+testing_data <- testing_data %>% 
+  select(-id_client)
+
+glimpse(training_data)
+
+rm(pg17train3, clients_index, clients_train, clients_unique)
+gc()
+```
+
+## Transform Datasets into Matrices
+
+```{r matrices, echo = TRUE}
+
+# Convert to a format that works well with XGBoost
+
+xgb_train <- xgb.DMatrix(data = as.matrix(training_data %>% 
+                                            select(-claim_count, -claim_amount, -exposures)), 
+                         label = as.matrix(training_data %>% select(claim_count)))
+
+xgb_test <- xgb.DMatrix(data = as.matrix(testing_data %>% 
+                                           select(-claim_count, -claim_amount, -exposures)), 
+                         label = as.matrix(testing_data %>% select(claim_count)))
+
+watchlist <- list(train = xgb_train,
+                  test = xgb_test)
+
+```
+
+## Hyperparameter Tuning
+
+```{r tuning, echo = TRUE}
+
+# tune.grid <- expand.grid(nrounds = c(10, 20, 30, 40, 50, 60, 70, 80, 90, 100),
+#                          max_depth = c(1,2,3,4,5,6,7,8),
+#                          eta = c(0.05,0.10,0.15,0.20,0.25,0.3),
+#                          gamma = c(0),
+#                          colsample_bytree = c(0.5,0.6,0.7,0.8,0.9,1),
+#                          min_child_weight = 1,
+#                          subsample = c(0.5,0.6,0.7,0.8,0.9,1))
+# 
+# tune.grid <- tune.grid %>%
+#   mutate(test_nloglik = 0)
+# 
+# for(i in 1:dim(tune.grid)[1]){
+# 
+# model_i <- xgb.train(data = xgb_train,
+#                      nrounds = tune.grid$nrounds[i],
+#                      max.depth = tune.grid$max_depth[i],
+#                      eta = tune.grid$eta[i],
+#                      gamma = 0,
+#                      colsample_bytree = tune.grid$colsample_bytree[i],
+#                      min_child_weight = 1,
+#                      subsample = tune.grid$subsample[i],
+#                      watchlist = watchlist,
+#                      objective = "count:poisson",
+#                      verbose = 0)
+# 
+# evaluation_log_i <- model_i[["evaluation_log"]]
+# test_nloglik_i <- as.numeric(evaluation_log_i$test_poisson_nloglik[dim(evaluation_log_i)[1]])
+# 
+# tune.grid$test_nloglik[i] <- test_nloglik_i
+# 
+# print(paste("Model",i,"Test Negative Log Likelihood",round(test_nloglik_i, digits = 5)))
+# 
+# }
+# 
+# write_csv(tune.grid,
+#           file = "C:/Users/samkl/OneDrive/Documents/R Projects/XGBoost Example/tune_grid.csv")
+
+tune.grid <- read_csv("C:/Users/samkl/OneDrive/Documents/R Projects/XGBoost Example/tune_grid.csv")
+
+tune.grid %>%
+  arrange(test_nloglik) %>%
+  head(n = 20)
+
+# Choose the 4th one down, because it has the least trees and similar test log-likelihood
+
+## Plots by hyperparameter
+
+nrounds_table <- tune.grid %>%
+  filter(max_depth == 5,
+         eta == 0.3,
+         colsample_bytree == 0.7,
+         subsample == 0.8)
+
+ggplot(nrounds_table, aes(x = nrounds, y = test_nloglik)) +
+  geom_line() +
+  ggtitle("Number of Trees vs. Test Negative Log-Likelihood")
+
+maxdepth_table <- tune.grid %>%
+  filter(nrounds == 30,
+         eta == 0.3,
+         colsample_bytree == 0.7,
+         subsample == 0.8)
+
+ggplot(maxdepth_table, aes(x = max_depth, y = test_nloglik)) +
+  geom_line() +
+  ggtitle("Max Depth vs. Test Negative Log-Likelihood")
+
+eta_table <- tune.grid %>%
+  filter(nrounds == 30,
+         max_depth == 5,
+         colsample_bytree == 0.7,
+         subsample == 0.8)
+
+ggplot(eta_table, aes(x = eta, y = test_nloglik)) +
+  geom_line() +
+  ggtitle("Learning Rate vs. Test Negative Log-Likelihood")
+
+# There is not much difference in test log-likelihood between eta 0.2 and eta 0.3
+
+colsample_table <- tune.grid %>%
+  filter(nrounds == 30,
+         max_depth == 5,
+         eta == 0.3,
+         subsample == 0.8)
+
+ggplot(colsample_table, aes(x = colsample_bytree, y = test_nloglik)) +
+  geom_line() +
+  ggtitle("Column Sample vs. Test Negative Log-Likelihood")
+
+subsample_table <- tune.grid %>%
+  filter(nrounds == 30,
+         max_depth == 5,
+         eta == 0.3,
+         colsample_bytree == 0.7)
+
+ggplot(subsample_table, aes(x = subsample, y = test_nloglik)) +
+  geom_line() +
+  ggtitle("Sub Sample vs. Test Negative Log-Likelihood")
+
+# Hyperparameters with lowest test negative log-likelihood
+tune.grid %>%
+  arrange(test_nloglik) %>%
+  head(n = 1)
+
+# Selected hyperparameters
+eta_table %>% filter(eta == 0.2)
+
+```
+
+## Final GBM - Count
+
+```{r model, echo = TRUE}
+
+final_model <- xgb.train(data = xgb_train,
+                     nrounds = 30,
+                     max.depth = 5,
+                     eta = 0.2,
+                     gamma = 0,
+                     colsample_bytree = 0.7,
+                     min_child_weight = 1,
+                     subsample = 0.8,
+                     watchlist = watchlist,
+                     objective = "count:poisson")
+
+```
+
+## Error Plot by Number of Trees
+
+```{r error_plot, echo = TRUE}
+
+evaluation_log <- final_model[["evaluation_log"]]
+
+# Graph negative log likelihood, as calculated after each tree by XGBoost
+ggplot(evaluation_log, aes(x = iter)) +
+  geom_line(aes(y = train_poisson_nloglik, colour = "train")) + 
+  geom_line(aes(y = test_poisson_nloglik, colour = "test")) +
+  ggtitle("Number of Trees vs. Negative Log-likelihood")
+```
+
+## Variable Importance Plot
+
+```{r variable_importance, echo = TRUE}
+
+importance_matrix <- xgb.importance(model = final_model)
+
+xgb.plot.importance(importance_matrix)
+
+```
+
+## Partial Dependence Plots
+
+```{r partial, echo = TRUE}
+
+# For the pdp::partial function to work, the column names in the training data table
+# need to match the column names in the saved xgb model exactly, including order
+
+# Check xgb model's list of feature names
+final_model$feature_names
+
+# Select the same columns from training data dataframe
+training_data2 <- training_data %>% 
+  select(pol_bonus, pol_duration, pol_sit_duration, drv_age1, drv_age_lic1,
+         vh_age, vh_cyl, vh_din, vh_sale_begin, vh_sale_end,
+         vh_speed, vh_value, vh_weight, coverage_Maxi, coverage_Median1,
+         coverage_Median2, coverage_Mini, pay_Biannual, pay_Monthly, pay_Quarterly,
+         pay_Yearly, usage_AllTrips, usage_Professional, usage_Retired, usage_WorkPrivate,
+         second_driver_Yes, driver_gender_F, fuel_Diesel, fuel_Gasoline, fuel_Hybrid, 
+         type_Commercial, type_Tourism)
+
+# Define a function to fix the settings for the pdp plots
+
+make_pdp_plot <- function(varname){
+  pdp::partial(
+    object = final_model,
+    pred.var = varname,
+    ice = F,
+    plot = T,
+    alpha = 1,
+    plot.engine = "ggplot2",
+    train = training_data2
+  )
+}
+
+make_pdp_plot(importance_matrix$Feature[1])
+make_pdp_plot(importance_matrix$Feature[2])
+make_pdp_plot(importance_matrix$Feature[3])
+make_pdp_plot(importance_matrix$Feature[4])
+make_pdp_plot(importance_matrix$Feature[5])
+make_pdp_plot(importance_matrix$Feature[6])
+make_pdp_plot(importance_matrix$Feature[7])
+make_pdp_plot(importance_matrix$Feature[8])
+make_pdp_plot(importance_matrix$Feature[9])
+make_pdp_plot(importance_matrix$Feature[10])
+make_pdp_plot(importance_matrix$Feature[11])
+make_pdp_plot(importance_matrix$Feature[12])
+make_pdp_plot(importance_matrix$Feature[13])
+make_pdp_plot(importance_matrix$Feature[14])
+make_pdp_plot(importance_matrix$Feature[15])
+make_pdp_plot(importance_matrix$Feature[16])
+make_pdp_plot(importance_matrix$Feature[17])
+make_pdp_plot(importance_matrix$Feature[18])
+make_pdp_plot(importance_matrix$Feature[19])
+make_pdp_plot(importance_matrix$Feature[20])
+make_pdp_plot(importance_matrix$Feature[21])
+make_pdp_plot(importance_matrix$Feature[22])
+make_pdp_plot(importance_matrix$Feature[23])
+make_pdp_plot(importance_matrix$Feature[24])
+make_pdp_plot(importance_matrix$Feature[25])
+make_pdp_plot(importance_matrix$Feature[26])
+make_pdp_plot(importance_matrix$Feature[27])
+make_pdp_plot(importance_matrix$Feature[28])
+make_pdp_plot(importance_matrix$Feature[29])
+make_pdp_plot(importance_matrix$Feature[30])
+
+setdiff(names(training_data2),importance_matrix$Feature)
+
+# Note: Fuel_Hybrid and coverage_Median1 didn't make the cut
+# They are not in the importance_matrix
+
+```
+
+## Shapley Plots
+
+```{r shapley, echo = TRUE}
+
+# Once again, we need training data predictors
+# However SHAPforxgboost wants this as a matrix
+train_matrix <- as.matrix(training_data2)
+            
+shap_long <- shap.prep(xgb_model = final_model, X_train = train_matrix)
+# shap.plot.summary(shap_long)
+
+# shap.plot.dependence(shap_long, "vh_age", color_feature = "auto",
+#                      alpha = 0.5, jitter_width = 0.1) +
+#   ggtitle("vh_age")
+
+
+                       
+# shap_long <- shap.prep(xgb_model = final_model,
+#                        X_train = xgb_train)
+
+# shap.plot.dependence(data_long = shap_long, x )
+
+# Define a function to fix the settings for the shapley plots
+
+make_shap_plot <- function(varname){
+  shap.plot.dependence(shap_long, 
+                         varname, 
+                         color_feature = "auto",
+                         alpha = 0.5,
+                         jitter_width = 0.1) +
+    ggtitle(varname)
+}
+
+make_shap_plot(importance_matrix$Feature[1])
+make_shap_plot(importance_matrix$Feature[2])
+make_shap_plot(importance_matrix$Feature[3])
+make_shap_plot(importance_matrix$Feature[4])
+make_shap_plot(importance_matrix$Feature[5])
+make_shap_plot(importance_matrix$Feature[6])
+make_shap_plot(importance_matrix$Feature[7])
+make_shap_plot(importance_matrix$Feature[8])
+make_shap_plot(importance_matrix$Feature[9])
+make_shap_plot(importance_matrix$Feature[10])
+make_shap_plot(importance_matrix$Feature[11])
+make_shap_plot(importance_matrix$Feature[12])
+make_shap_plot(importance_matrix$Feature[13])
+make_shap_plot(importance_matrix$Feature[14])
+make_shap_plot(importance_matrix$Feature[15])
+make_shap_plot(importance_matrix$Feature[16])
+make_shap_plot(importance_matrix$Feature[17])
+make_shap_plot(importance_matrix$Feature[18])
+make_shap_plot(importance_matrix$Feature[19])
+make_shap_plot(importance_matrix$Feature[20])
+make_shap_plot(importance_matrix$Feature[21])
+make_shap_plot(importance_matrix$Feature[22])
+make_shap_plot(importance_matrix$Feature[23])
+make_shap_plot(importance_matrix$Feature[24])
+make_shap_plot(importance_matrix$Feature[25])
+make_shap_plot(importance_matrix$Feature[26])
+make_shap_plot(importance_matrix$Feature[27])
+make_shap_plot(importance_matrix$Feature[28])
+make_shap_plot(importance_matrix$Feature[29])
+make_shap_plot(importance_matrix$Feature[30])
+
+```
+
+## Decile Plot
+
+```{r decile_plot, echo = TRUE}
+
+predictions <- predict(final_model, newdata = xgb_test, type = "response")
+
+total_expos <- sum(testing_data$exposures)
+
+decile_table <- testing_data %>% 
+  mutate(predictions = predictions) %>% 
+  arrange(predictions) %>% 
+  mutate(decile = if_else(cumsum(exposures)==total_expos,
+                         10,
+                         floor(10*cumsum(exposures)/total_expos)+1)) %>% 
+  group_by(decile) %>% 
+  summarize(fitted_average = as.double(format(sum(predictions)/sum(exposures),scientific = F)),
+            observed_average = sum(claim_count)/sum(exposures))
+
+decile_plot_data <- pivot_longer(decile_table, 
+                                 cols = c("fitted_average", "observed_average"),
+                                 names_to = "metric")
+
+
+ggplot(decile_plot_data, aes(x = decile)) +
+  geom_line(aes(y = value, color = metric)) +
+  scale_x_continuous(limits = c(1,10), breaks = seq(1,10,1)) +
+  labs(x = "Decile", y= "Frequency") +
+  ggtitle("Decile Plot - Test Data")
+  
+```
+
+## All Possible Predictions
+
+```{r all_predictions, echo = TRUE}
+
+all_data <- bind_rows(training_data, testing_data)
+
+possible.values <- all_data %>% 
+  select(-claim_count, -claim_amount, -exposures) %>% 
+  distinct() %>% 
+  as.matrix()
+  
+all_predictions <- predict(final_model, newdata = possible.values, type = "response")
+
+predictions_documentation <- all_data %>% 
+  select(-claim_count, -claim_amount, -exposures) %>% 
+  distinct() %>% 
+  mutate(predictions = all_predictions)
+
+# write_csv(predictions_documentation,
+#           file = "C:/Users/samkl/OneDrive/Documents/R Projects/XGBoost Example/predictions_documentation.csv")
+
+```
+
+## Plot all trees
+
+```{r tree_plot, echo = TRUE}
+
+## Tree Plots
+
+# Print values at tree nodes
+# xgb.dump(final_model, with_stats = TRUE)
+
+make_tree_plot <- function(treenum){
+  xgb.plot.tree(model = final_model,
+                trees = treenum,
+                plot_width = 1600,
+                plot_height = 2000)
+}
+```
+
+```{r tree1, echo = TRUE}
+make_tree_plot(0)
+make_tree_plot(1)
+make_tree_plot(2)
+make_tree_plot(3)
+make_tree_plot(4)
+make_tree_plot(5)
+make_tree_plot(6)
+make_tree_plot(7)
+make_tree_plot(8)
+make_tree_plot(9)
+make_tree_plot(10)
+make_tree_plot(11)
+make_tree_plot(12)
+make_tree_plot(13)
+make_tree_plot(14)
+make_tree_plot(15)
+make_tree_plot(16)
+make_tree_plot(17)
+make_tree_plot(18)
+make_tree_plot(19)
+make_tree_plot(20)
+make_tree_plot(21)
+make_tree_plot(22)
+make_tree_plot(23)
+make_tree_plot(24)
+make_tree_plot(25)
+make_tree_plot(26)
+make_tree_plot(27)
+make_tree_plot(28)
+make_tree_plot(29)
+```
+
+## Actual vs. Expected
+
+```{r a_v_e, echo = TRUE}
+
+predictions <- predict(final_model, newdata = xgb_test, type = "response")
+
+total_expos <- sum(testing_data$exposures)
+
+testing_data <- testing_data %>% 
+  mutate(predictions = predictions)
+
+varname <- "drv_age1"
+
+make_a_v_e <- function(varname){
+  var_table <- testing_data %>% 
+  group_by_at(varname) %>% 
+  summarize(fitted_average = sum(predictions)/sum(exposures),
+            observed_average = sum(claim_count)/sum(exposures))
+  
+  var_table_long <- pivot_longer(var_table, 
+                                 cols = c("fitted_average", "observed_average"),
+                                 names_to = "metric")
+  
+  plot_name <- paste("Actual vs. Expected - Test Data -",varname)
+  
+  ggplot(var_table_long, aes_string(x = varname)) +
+  geom_line(aes(y = value, color = metric)) +
+  labs(x = varname, y= "Frequency") +
+  ggtitle(plot_name)
+}
+
+make_a_v_e(importance_matrix$Feature[1])
+make_a_v_e(importance_matrix$Feature[2])
+make_a_v_e(importance_matrix$Feature[3])
+make_a_v_e(importance_matrix$Feature[4])
+make_a_v_e(importance_matrix$Feature[5])
+make_a_v_e(importance_matrix$Feature[6])
+make_a_v_e(importance_matrix$Feature[7])
+make_a_v_e(importance_matrix$Feature[8])
+make_a_v_e(importance_matrix$Feature[9])
+make_a_v_e(importance_matrix$Feature[10])
+make_a_v_e(importance_matrix$Feature[11])
+make_a_v_e(importance_matrix$Feature[12])
+make_a_v_e(importance_matrix$Feature[13])
+make_a_v_e(importance_matrix$Feature[14])
+make_a_v_e(importance_matrix$Feature[15])
+make_a_v_e(importance_matrix$Feature[16])
+make_a_v_e(importance_matrix$Feature[17])
+make_a_v_e(importance_matrix$Feature[18])
+make_a_v_e(importance_matrix$Feature[19])
+make_a_v_e(importance_matrix$Feature[20])
+make_a_v_e(importance_matrix$Feature[21])
+make_a_v_e(importance_matrix$Feature[22])
+make_a_v_e(importance_matrix$Feature[23])
+make_a_v_e(importance_matrix$Feature[24])
+make_a_v_e(importance_matrix$Feature[25])
+make_a_v_e(importance_matrix$Feature[26])
+make_a_v_e(importance_matrix$Feature[27])
+make_a_v_e(importance_matrix$Feature[28])
+make_a_v_e(importance_matrix$Feature[29])
+make_a_v_e(importance_matrix$Feature[30])
+
+```
+
+## Scrutinize Less Important Variables
+
+```{r a_v_e, echo = TRUE}
+
+# Revisit Variable Importance Plot
+xgb.plot.importance(importance_matrix)
+
+# Less Important Variables
+importance_matrix %>% 
+  filter(Importance < .01)
+
+# Build a model excluding the less important variables
+# Start by preparing the data
+
+training_data_subset <- training_data %>% 
+  select(-claim_count, -claim_amount, -exposures) %>% 
+    select(-second_driver_Yes,
+         -usage_Retired,
+         -coverage_Median2,
+         -driver_gender_F,
+         -usage_AllTrips,
+         -pay_Quarterly,
+         -pay_Yearly,
+         -pay_Biannual,
+         -coverage_Median1,
+         -pay_Monthly,
+         -type_Commercial,
+         -usage_WorkPrivate)
+
+testing_data_subset <- testing_data %>% 
+  select(-claim_count, -claim_amount, -exposures) %>% 
+  select(-predictions) %>% 
+    select(-second_driver_Yes,
+         -usage_Retired,
+         -coverage_Median2,
+         -driver_gender_F,
+         -usage_AllTrips,
+         -pay_Quarterly,
+         -pay_Yearly,
+         -pay_Biannual,
+         -coverage_Median1,
+         -pay_Monthly,
+         -type_Commercial,
+         -usage_WorkPrivate)
+
+xgb_train_subset <- xgb.DMatrix(data = as.matrix(training_data_subset), 
+                         label = as.matrix(training_data %>% select(claim_count)))
+
+xgb_test_subset <- xgb.DMatrix(data = as.matrix(testing_data_subset), 
+                         label = as.matrix(testing_data %>% select(claim_count)))
+
+watchlist_subset <- list(train = xgb_train_subset,
+                  test = xgb_test_subset)
+
+# Run the models with the subset of variables
+
+final_model_subset <- xgb.train(data = xgb_train_subset,
+                     nrounds = 30,
+                     max.depth = 5,
+                     eta = 0.2,
+                     gamma = 0,
+                     colsample_bytree = 0.7,
+                     min_child_weight = 1,
+                     subsample = 0.8,
+                     watchlist = watchlist_subset,
+                     objective = "count:poisson")
+
+# Calculate predictions from the model built on the subset of variables
+
+predictions2 <- predict(final_model_subset, newdata = xgb_test_subset, type = "response")
+
+testing_data <- testing_data %>% 
+  mutate(predictions = predictions) %>% 
+  mutate(predictions2 = predictions2)
+
+# Create a function for comparing the fitted averages from both models with observed average
+
+make_a_v_e2 <- function(varname){
+  var_table <- testing_data %>% 
+  group_by_at(varname) %>% 
+  summarize(fitted_average1 = sum(predictions)/sum(exposures),
+            fitted_average2 = sum(predictions2)/sum(exposures),
+            observed_average = sum(claim_count)/sum(exposures))
+  
+  var_table_long <- pivot_longer(var_table, 
+                                 cols = c("fitted_average1", "fitted_average2","observed_average"),
+                                 names_to = "metric")
+  
+  plot_name <- paste("Actual vs. Expected - Test Data -",varname)
+  
+  ggplot(var_table_long, aes_string(x = varname)) +
+  geom_line(aes(y = value, color = metric)) +
+  labs(x = varname, y= "Frequency") +
+  ggtitle(plot_name)
+}
+
+# Note that removing the less important variables has negligible impact on the Actual vs. Expected Plots
+
+make_a_v_e2("second_driver_Yes")
+make_a_v_e2("usage_Retired")
+make_a_v_e2("coverage_Median2")
+make_a_v_e2("driver_gender_F")
+make_a_v_e2("usage_AllTrips")
+make_a_v_e2("pay_Quarterly")
+make_a_v_e2("pay_Yearly")
+make_a_v_e2("pay_Biannual")
+make_a_v_e2("coverage_Median1")
+make_a_v_e2("pay_Monthly")
+make_a_v_e2("type_Commercial")
+make_a_v_e2("usage_WorkPrivate")
+
+# Note that training nloglik is lower for initial model with more variables
+# Note that testing nloglik is lower for subset model with less variables
+
+evaluation_log1 <- final_model[["evaluation_log"]]
+evaluation_log1[30,]
+
+evaluation_log2 <- final_model_subset[["evaluation_log"]]
+evaluation_log2[30,]
+
+importance_matrix2 <- xgb.importance(model = final_model_subset)
+xgb.plot.importance(importance_matrix2)
+
+```
