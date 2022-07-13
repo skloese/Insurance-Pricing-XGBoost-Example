@@ -1,7 +1,7 @@
 ---
 title: "XGBoost_Example"
 author: "Sam Kloese"
-date: '2022-06-08'
+date: '2022-07-13'
 output: pdf_document
 always_allow_html: true
 ---
@@ -16,13 +16,17 @@ library(pdp) # For Partial Dependence Plots
 library(xgboost) # For creating xgboost
 library(SHAPforxgboost) # For Shapley Plots
 library(knitr) # For generating markdowns
-library(webshot)
-set.seed(23)
+library(webshot) # For putting tree plot images in a PDF
+
+set.seed(23) # For reproducibility
 data(pg17trainpol) # Load policy data
 data(pg17trainclaim) # Load claims data
 ```
 
 ## Preliminary Data Assembly
+
+The claims table and the policy info table are separate. I merge them together
+and remove the NAs, which represent a very small portion of the data.
 
 ```{r preliminary, echo = TRUE}
 # Take a look at our data
@@ -59,6 +63,14 @@ rm(pg17train, pg17trainclaim, pg17trainclaim2, pg17trainpol)
 ```
 
 ## Convert Predictors to Numerical Values
+
+The xgboost package runs on matrices. Matrices require all data to be numerical.
+Some of our data is currently categorical (the variables are groups described in
+text). I convert all categorical variables to "indicator" columns. 
+
+I remove some variables for simplicity of the example. I rename the remaining
+variables so they don't have spaces in the variable names. I remove a small 
+number of records will illogical negative claim amounts.
 
 ```{r numerical, echo = TRUE}
 
@@ -119,6 +131,10 @@ gc()
 
 ## Split Training and Testing
 
+I split the data into 2 data subsets: training and testing. The subsets are
+split by client, so that a client which appears in training will not appear in
+testing. The split is 80% for training and the remaining 20% for testing.
+
 ```{r split, echo = TRUE}
 
 # 80% of clients will be used in training
@@ -147,6 +163,13 @@ gc()
 
 ## Transform Datasets into Matrices
 
+Xgboost does not work on dataframes. It works on matrices. This section converts
+the current dataframes into matrices. Note: "label" essentially means the 
+target variable. The watchlist contains both the training data in matrix form
+and testing data in matrix form. Setting up a watchlist allows for training
+with the train data and generating error metrics on testing data using the 
+xgb.train function. 
+
 ```{r matrices, echo = TRUE}
 
 # Convert to a format that works well with XGBoost
@@ -165,6 +188,27 @@ watchlist <- list(train = xgb_train,
 ```
 
 ## Hyperparameter Tuning
+
+This section conducts a lengthy grid search for the tuning parameters. The 
+commented out section (starting with '#' on each line) runs the model on 17,280
+different combinations of hyperparameters. On each model run, the model is fit
+using the training data, and the negative log-likelihood is captured on the
+testing dataset. Minimizing log-liklihood also minimizes deviance.
+
+The grid search takes an extremely long time. There is a seperate .csv file
+uploaded to GitHub which includes the results of this process. The file is
+named tune_grid.csv. I recommend referring to that document instead of 
+uncommenting out the code below and rerunning it.
+
+After running this grid search, I looked at the 20 iterations with the lowest
+negative log-liklihood. I selected the set of hyperparameters with the 4th 
+lowest negative log-liklihood, since it has a low number of trees and 
+the negative log-liklihood is still close to the negative log-likelihood of the 
+top candidate model.
+
+Once I have selected my hyperparameters, I show plots for each hyperparameter of
+what the negative log-likelihood on testing data would be if I changed the value 
+of that hyperparameter.
 
 ```{r tuning, echo = TRUE}
 
@@ -205,6 +249,7 @@ watchlist <- list(train = xgb_train,
 # write_csv(tune.grid,
 #           file = "C:/Users/samkl/OneDrive/Documents/R Projects/XGBoost Example/tune_grid.csv")
 
+# Look for the tune_grid.csv file on GitHub
 tune.grid <- read_csv("C:/Users/samkl/OneDrive/Documents/R Projects/XGBoost Example/tune_grid.csv")
 
 tune.grid %>%
@@ -277,7 +322,12 @@ eta_table %>% filter(eta == 0.2)
 
 ```
 
-## Final GBM - Count
+## Final GBM
+
+I noted in the plots above that using a learning rate (eta) of 0.2 produced
+similar negative log-likelihood to a learning rate of 0.3. My final 
+hyperparameter selection uses a learning rate of 0.2. I refit the model a 
+final time with selected hyperparameters.
 
 ```{r model, echo = TRUE}
 
@@ -296,6 +346,12 @@ final_model <- xgb.train(data = xgb_train,
 
 ## Error Plot by Number of Trees
 
+I produce a plot to demonstrate that each additional tree is reducing 
+negative log-likelihood. There is a seperate line for the training data negative
+log-likelihood and testing data negative log-likelihood. The X-Axis shows the 
+number of trees. The Y-Axis shows negative log-likelihood after each tree is 
+added to the ensemble of trees.
+
 ```{r error_plot, echo = TRUE}
 
 evaluation_log <- final_model[["evaluation_log"]]
@@ -309,6 +365,9 @@ ggplot(evaluation_log, aes(x = iter)) +
 
 ## Variable Importance Plot
 
+I produce a variable importance plot. The variable importance plot shows which
+variables contribute the most to the model. 
+
 ```{r variable_importance, echo = TRUE}
 
 importance_matrix <- xgb.importance(model = final_model)
@@ -318,6 +377,9 @@ xgb.plot.importance(importance_matrix)
 ```
 
 ## Partial Dependence Plots
+
+I produce partial dependence plots for model interpretability. I create a custom
+function to fix the settings that I want to use in the pdp::partial() function.
 
 ```{r partial, echo = TRUE}
 
@@ -350,7 +412,12 @@ make_pdp_plot <- function(varname){
     train = training_data2
   )
 }
+```
 
+I run my custom function on each variable. I produce the plots in the order that
+they appear in the variable importance plot.
+
+```{r partial2, echo = FALSE}
 make_pdp_plot(importance_matrix$Feature[1])
 make_pdp_plot(importance_matrix$Feature[2])
 make_pdp_plot(importance_matrix$Feature[3])
@@ -391,6 +458,15 @@ setdiff(names(training_data2),importance_matrix$Feature)
 
 ## Shapley Plots
 
+I produce Shapley plots for interpretability plots. Shapley plots are useful
+because unlike partial dependence plots, they do not assume the variables are
+uncorrelated. Shapley plots are computationally instensive and may be difficult
+to provide on datasets that are much longer than the one used in this
+exercise.
+
+I create a custom function to fix the settings that I want to use in the
+shap.plot.dependence() function.
+
 ```{r shapley, echo = TRUE}
 
 # Once again, we need training data predictors
@@ -421,7 +497,12 @@ make_shap_plot <- function(varname){
                          jitter_width = 0.1) +
     ggtitle(varname)
 }
+```
 
+I run my custom function on each variable. I produce the plots in the order that
+they appear in the variable importance plot.
+
+```{r shapley2, echo = FALSE}
 make_shap_plot(importance_matrix$Feature[1])
 make_shap_plot(importance_matrix$Feature[2])
 make_shap_plot(importance_matrix$Feature[3])
@@ -452,10 +533,17 @@ make_shap_plot(importance_matrix$Feature[27])
 make_shap_plot(importance_matrix$Feature[28])
 make_shap_plot(importance_matrix$Feature[29])
 make_shap_plot(importance_matrix$Feature[30])
-
 ```
 
 ## Decile Plot
+
+I create a decile plot. The decile plot sorts the testing dataset in order of
+lowest predictions to highest, then 10 roughly equal sized groups are created,
+and the observed average and fitted average are calculated for each decile. I
+plot observed average and fitted average. An ideal plot would be monotonic
+(observed average would increase left to right), have significant lift (large
+vertical distance between decile 1 and decile 10), and demonstrate predictive
+accuracy (fitted averages would be close to observed averages).
 
 ```{r decile_plot, echo = TRUE}
 
@@ -488,6 +576,17 @@ ggplot(decile_plot_data, aes(x = decile)) +
 
 ## All Possible Predictions
 
+I want to create a table of predictions so that an algorithm in production 
+(rating algorithm) could potentially be audited. I start by making a table of 
+all distinct predictor variable values appearing in either training or testing. 
+Then I make predictions using my selected model. This table can be written to a 
+.csv file if you uncomment the last line of this section.
+
+Note: For complete documentation, my recommendation would be to create a table 
+like this that also includes all possible values of predictor variables. 
+(This might be a longer list than just what has been seen within current 
+experience).
+
 ```{r all_predictions, echo = TRUE}
 
 all_data <- bind_rows(training_data, testing_data)
@@ -511,6 +610,9 @@ predictions_documentation <- all_data %>%
 
 ## Plot all trees
 
+I plot each tree that comprises my model. I create a custom function to fix the 
+settings that I want to use in the xgb.plot.tree() function.
+
 ```{r tree_plot, echo = TRUE}
 
 ## Tree Plots
@@ -526,8 +628,11 @@ make_tree_plot <- function(treenum){
 }
 ```
 
-```{r tree1, echo = TRUE}
-make_tree_plot(0)
+I run my custom function on each variable. I produce the plots in the order that
+they appear in the variable importance plot.
+
+```{r tree2, echo = FALSE}
+make_tree_plot(0) # Xgboost labels the first tree as tree number "0"
 make_tree_plot(1)
 make_tree_plot(2)
 make_tree_plot(3)
@@ -556,10 +661,18 @@ make_tree_plot(25)
 make_tree_plot(26)
 make_tree_plot(27)
 make_tree_plot(28)
-make_tree_plot(29)
+make_tree_plot(29) # There are 30 trees, when you count tree number "0"
 ```
 
 ## Actual vs. Expected
+
+I create univariate plots of observed average vs. fitted average for each
+variable. I am hoping that the observed average is close to fitted average
+across all variable levels. The data may be noisier for levels with low data
+volume. 
+
+I create a custom function to calculate and plot actual vs. expected frequency, 
+given a variable name as input.
 
 ```{r a_v_e, echo = TRUE}
 
@@ -590,6 +703,12 @@ make_a_v_e <- function(varname){
   ggtitle(plot_name)
 }
 
+```
+
+I run my custom function on each variable. I produce the plots in the order that
+they appear in the variable importance plot.
+
+```{r a_v_e2, echo = FALSE}
 make_a_v_e(importance_matrix$Feature[1])
 make_a_v_e(importance_matrix$Feature[2])
 make_a_v_e(importance_matrix$Feature[3])
@@ -623,9 +742,25 @@ make_a_v_e(importance_matrix$Feature[30])
 
 ```
 
+The plots could be improved by bucketing some of the variable levels. I may work
+on this in future updates to this GitHub example. Some of the plots seem to 
+indicate that the model is not validating well. It may be worth considering
+removing these variables with plots that don't look so good:
+- Driver Gender Female
+- Pay Biannual
+- Usage WorkPrivate
+
 ## Scrutinize Less Important Variables
 
-```{r a_v_e, echo = TRUE}
+The following is an experiment in removing some of the variables deemed less
+important according to the variable importance plot. The model is refit using
+a subset of variables. Then we look to see if the actual vs. expected plots
+still look okay for the variables which were removed from the model. We are
+checking to see if we are no longer able to get adequate fit once the variable
+is removed. Lastly, I check to see how the model fit statistics (negative 
+log-likelihood) change. Lastly, I create an updated variable importance plot.
+
+```{r subset_model, echo = TRUE}
 
 # Revisit Variable Importance Plot
 xgb.plot.importance(importance_matrix)
